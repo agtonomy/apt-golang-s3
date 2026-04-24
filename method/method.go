@@ -20,6 +20,7 @@ package method
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -38,15 +39,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 
 	"github.com/google/apt-golang-s3/message"
 )
@@ -133,7 +133,7 @@ func New(logger *log.Logger) *Method {
 	var waitGroup sync.WaitGroup
 	waitGroup.Add(1)
 	return &Method{
-		region:     endpoints.UsEast1RegionID,
+		region:     "us-west-2",
 		msgChan:    make(chan []byte),
 		configured: false,
 		wg:         &waitGroup,
@@ -243,31 +243,46 @@ func newLocation(value, s3Hostname string) (objectLocation, error) {
 	if err != nil {
 		return objectLocation{}, err
 	}
-	if uri.Host == s3Hostname {
-		tokens := strings.Split(uri.Path, "/")
 
-		// Splitting "/bucket/this/is/a/path" on "/" produces
-		// ["", "bucket", "this", "is", "a", "path"]
-		// Note the initial empty string
-		if len(tokens) < locationMinTokensCount {
-			return objectLocation{}, errLocMissingRequiredTokens
-		}
-
-		// The first non-zero length string is assumed to be the bucket. The rest are
-		// concatenated back together as the path to the object in the bucket.
-		return objectLocation{
-			uri:    uri,
-			bucket: tokens[1],
-			key:    strings.Join(tokens[2:], "/"),
-		}, nil
+	// APT builds URIs from sources.list, which typically points at the global
+	// "s3.amazonaws.com" hostname regardless of the bucket's actual region.
+	// Accept both the region-specific hostname and the global alias as
+	// path-style S3 URLs.
+	pathStyleHosts := []string{s3Hostname}
+	if s3Hostname != "s3.amazonaws.com" {
+		pathStyleHosts = append(pathStyleHosts, "s3.amazonaws.com")
 	}
 
-	if strings.HasSuffix(uri.Host, s3Hostname) {
-		return objectLocation{
-			uri:    uri,
-			bucket: strings.TrimSuffix(uri.Host, "."+s3Hostname),
-			key:    uri.Path[1:],
-		}, nil
+	for _, h := range pathStyleHosts {
+		if uri.Host == h {
+			tokens := strings.Split(uri.Path, "/")
+
+			// Splitting "/bucket/this/is/a/path" on "/" produces
+			// ["", "bucket", "this", "is", "a", "path"]
+			// Note the initial empty string
+			if len(tokens) < locationMinTokensCount {
+				return objectLocation{}, errLocMissingRequiredTokens
+			}
+
+			// The first non-zero length string is assumed to be the bucket.
+			// The rest are concatenated back together as the path to the
+			// object in the bucket.
+			return objectLocation{
+				uri:    uri,
+				bucket: tokens[1],
+				key:    strings.Join(tokens[2:], "/"),
+			}, nil
+		}
+	}
+
+	for _, h := range pathStyleHosts {
+		if strings.HasSuffix(uri.Host, "."+h) {
+			return objectLocation{
+				uri:    uri,
+				bucket: strings.TrimSuffix(uri.Host, "."+h),
+				key:    uri.Path[1:],
+			}, nil
+		}
 	}
 
 	return objectLocation{
@@ -322,23 +337,18 @@ func (method *Method) uriAcquire(msg *message.Message) {
 
 	method.outputRequestStatus(objLoc.uri, fieldValueConnecting)
 
-	client := method.s3Client(objLoc.uri.User)
+	ctx := context.Background()
+	client := method.s3Client(ctx, objLoc.uri.User)
 
 	headObjectInput := &s3.HeadObjectInput{Bucket: &objLoc.bucket, Key: &objLoc.key}
-	headObjectOutput, err := client.HeadObject(headObjectInput)
+	headObjectOutput, err := client.HeadObject(ctx, headObjectInput)
 	if err != nil {
-		//nolint:errorlint
-		if reqErr, ok := err.(awserr.RequestFailure); ok {
-			if reqErr.StatusCode() == http.StatusNotFound {
-				method.outputNotFound(objLoc.uri)
-				return
-			}
-			// if the error is an awserr.RequestFailure, but the status was not 404
-			// handle the error
-			method.handleError(err)
-		} else {
-			method.handleError(err)
+		var respErr *awshttp.ResponseError
+		if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusNotFound {
+			method.outputNotFound(objLoc.uri)
+			return
 		}
+		method.handleError(err)
 	}
 
 	expectedLen := *headObjectOutput.ContentLength
@@ -353,41 +363,40 @@ func (method *Method) uriAcquire(msg *message.Message) {
 	method.handleError(err)
 	defer file.Close()
 
-	downloader := s3manager.NewDownloaderWithClient(client)
-	numBytes, err := downloader.Download(file,
-		&s3.GetObjectInput{
-			Bucket: aws.String(objLoc.bucket),
-			Key:    aws.String(objLoc.key),
-		})
+	downloader := transfermanager.New(client)
+	out, err := downloader.DownloadObject(ctx, &transfermanager.DownloadObjectInput{
+		Bucket:   aws.String(objLoc.bucket),
+		Key:      aws.String(objLoc.key),
+		WriterAt: file,
+	})
 	method.handleError(err)
 
-	method.outputURIDone(objLoc.uri, numBytes, lastModified, filename)
+	method.outputURIDone(objLoc.uri, *out.ContentLength, lastModified, filename)
 }
 
-// s3Client provides an initialized s3iface.S3API based on the contents of the
+// s3Client provides an initialized *s3.Client based on the contents of the
 // provided url.URL. The access key id and secret access key are assumed to
 // correspond to the Username() and Password() functions on the URL's User.
-func (method *Method) s3Client(user *url.Userinfo) s3iface.S3API {
-	config := &aws.Config{
-		Region: aws.String(method.region),
-	}
-	sess, err := session.NewSession(config)
+func (method *Method) s3Client(ctx context.Context, user *url.Userinfo) *s3.Client {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(method.region))
 	if err != nil {
-		method.handleError(fmt.Errorf("creating AWS session: %w", err))
-	}
-	if accessKeyID := user.Username(); accessKeyID != "" {
-		// Use explicitly specified static credentials to access S3
-		if secretAccessKey, ok := user.Password(); ok {
-			config.Credentials = credentials.NewStaticCredentials(accessKeyID, secretAccessKey, "")
-		} else {
-			method.handleError(errAcqMsgMissingRequiredFieldPassword)
-		}
-	} else if method.roleARN != "" {
-		// Use default credential chain to assume specified role
-		config.Credentials = stscreds.NewCredentials(sess, method.roleARN)
+		method.handleError(fmt.Errorf("loading AWS config: %w", err))
 	}
 
-	return s3.New(sess, config)
+	if accessKeyID := user.Username(); accessKeyID != "" {
+		// Use explicitly specified static credentials to access S3
+		secretAccessKey, ok := user.Password()
+		if !ok {
+			method.handleError(errAcqMsgMissingRequiredFieldPassword)
+		}
+		cfg.Credentials = credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, "")
+	} else if method.roleARN != "" {
+		// Use default credential chain to assume specified role
+		stsClient := sts.NewFromConfig(cfg)
+		cfg.Credentials = aws.NewCredentialsCache(stscreds.NewAssumeRoleProvider(stsClient, method.roleARN))
+	}
+
+	return s3.NewFromConfig(cfg)
 }
 
 // configure loops though the Config-Item fields of a configuration Message and

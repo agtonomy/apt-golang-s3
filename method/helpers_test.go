@@ -53,7 +53,7 @@ func TestS3EndpointURL(t *testing.T) {
 			},
 			false,
 		},
-		"outer-space-0": {
+		"": {
 			nil,
 			true,
 		},

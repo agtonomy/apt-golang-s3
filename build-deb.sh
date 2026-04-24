@@ -18,11 +18,11 @@ set -e # Exit on non-zero return codes
 set -u # Exit on undefined variables
 
 PACKAGE_NAME=apt-golang-s3
-VERSION=${1:-1}
+VERSION=${1:-1.1}
 
 go get
 
-go build -ldflags '-s -w' -o $PACKAGE_NAME
+go build -buildvcs=false -ldflags '-s -w' -o $PACKAGE_NAME
 
 chmod +x ./$PACKAGE_NAME
 
@@ -31,9 +31,13 @@ fpm -s dir \
   --force \
   --description "An apt transport method for downloading packages from repositories hosted in s3. Written in Go." \
   --name $PACKAGE_NAME \
-  --version $VERSION \
-  --maintainer fabric-infrastructure-team \
+  --version "$VERSION" \
+  --maintainer Agtonomy \
+  --deb-priority '' \
+  --license Apache-2.0 \
+  --provides apt-transport-s3 \
+  --conflicts apt-transport-s3 \
   --replaces apt-transport-s3 \
   --url https://github.com/google/apt-golang-s3 \
-  --vendor "Google Fabric" \
-  ./$PACKAGE_NAME=/usr/lib/apt/methods/s3 ${@:3}
+  --vendor '' \
+  ./$PACKAGE_NAME=/usr/lib/apt/methods/s3 "${@:3}"

@@ -14,20 +14,31 @@
 package method
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
-
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"strings"
 )
 
-func s3EndpointURL(region string) (*url.URL, error) {
-	resolver := endpoints.DefaultResolver()
+var errEmptyRegion = errors.New("region is required")
 
-	endpoint, err := resolver.EndpointFor(s3.EndpointsID, region, endpoints.StrictMatchingOption)
-	if err != nil {
-		return nil, fmt.Errorf("resolving S3 endpoint for region %s: %w", region, err)
+// s3EndpointURL returns the default S3 endpoint URL for the given region.
+// us-east-1 uses the legacy global hostname; cn-* regions use the .com.cn
+// suffix; everything else follows s3.<region>.amazonaws.com.
+func s3EndpointURL(region string) (*url.URL, error) {
+	if region == "" {
+		return nil, errEmptyRegion
 	}
 
-	return url.Parse(endpoint.URL)
+	var host string
+	switch {
+	case region == "us-east-1":
+		host = "s3.amazonaws.com"
+	case strings.HasPrefix(region, "cn-"):
+		host = fmt.Sprintf("s3.%s.amazonaws.com.cn", region)
+	default:
+		host = fmt.Sprintf("s3.%s.amazonaws.com", region)
+	}
+
+	return &url.URL{Scheme: "https", Host: host}, nil
 }

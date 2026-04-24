@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.13
+FROM golang:1.24-bookworm
 
-ENV BUILD_DIR /app
+ENV BUILD_DIR=/app
 
 RUN mkdir -p $BUILD_DIR
 WORKDIR $BUILD_DIR
 
 RUN apt-get update
 RUN apt-get install ruby-dev -y
-RUN gem install fpm --no-ri --no-rdoc
+RUN gem install fpm --no-document
 
 COPY . $BUILD_DIR/
